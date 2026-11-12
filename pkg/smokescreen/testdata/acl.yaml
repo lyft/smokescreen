@@ -1,0 +1,41 @@
+---
+version: v2
+services:
+  - name: test-trusted-srv
+    project: security
+    action: enforce
+    allow:
+      - domains: [notarealhost.test, httpbin.org]
+  - name: test-local-srv
+    project: security
+    action: open
+    allow:
+      - domains: [127.0.0.1]
+  - name: test-open-srv
+    project: security
+    action: open
+  - name: test-external-connect-proxy-blocked-srv
+    project: security
+    action: enforce
+    proxies: [myproxy.com, otherproxy.org]
+    allow:
+      - domains: [127.0.0.1]
+  - name: test-external-connect-proxy-allowed-srv
+    project: security
+    action: enforce
+    proxies: [localhost, myproxy.com, myproxy2.com, thisisaproxy.com]
+    allow:
+      - domains: [127.0.0.1]
+  - name: test-mitm
+    project: security
+    action: enforce
+    allow:
+      - domains: [127.0.0.1]
+        mitm:
+          add_headers:
+            Accept-Language: el
+          detailed_http_logs: true
+          detailed_http_logs_full_headers: [User-Agent]
+
+global:
+  deny: [stripe.com]

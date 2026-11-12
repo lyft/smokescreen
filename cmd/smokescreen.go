@@ -1,0 +1,453 @@
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/stripe/smokescreen/v2/pkg/smokescreen"
+	"github.com/stripe/smokescreen/v2/pkg/smokescreen/conntrack"
+)
+
+// Process command line args into a configuration object.  If the "--help" or
+// "--version" flags are provided, return nil with no error.
+// If args is nil, os.Args will be used.  If logger is nil, a default logger
+// will be created and included in the returned configuration.
+func NewConfiguration(args []string, logger *slog.Logger) (*smokescreen.Config, error) {
+	if args == nil {
+		args = os.Args
+	}
+
+	var configToReturn *smokescreen.Config
+	metricTagValues := &stringSliceValue{}
+
+	app := &cli.Command{}
+	app.Name = "smokescreen"
+	app.Version = "devel"
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		app.Version = buildInfo.Main.Version
+	}
+	app.Usage = "A simple HTTP proxy that prevents SSRF and can restrict destinations"
+	app.ArgsUsage = " " // blank but non-empty to suppress default "[arguments...]"
+
+	// Suppress the "help" subcommand, as we have no other subcommands, while
+	// retaining urfave/cli's built-in --help flag.
+	app.HideHelpCommand = true
+
+	app.Flags = []cli.Flag{
+		&cli.StringFlag{
+			Name:  "config-file",
+			Usage: "Load configuration from `FILE`.  Command line options override values in the file.",
+		},
+		&cli.StringFlag{
+			Name:  "listen-ip",
+			Usage: "Listen on interface with address `IP`.\n\t\tThis argument is ignored when running under Einhorn. (default: any)",
+		},
+		&cli.UintFlag{
+			Name:  "listen-port",
+			Value: uint(smokescreen.DefaultPort),
+			Usage: "Listen on port `PORT`.\n\t\tThis argument is ignored when running under Einhorn.",
+		},
+		&cli.DurationFlag{
+			Name:  "timeout",
+			Value: smokescreen.DefaultConnectTimeout,
+			Usage: "Time out after `DURATION` when connecting.",
+		},
+		&cli.BoolFlag{
+			Name:  "proxy-protocol",
+			Usage: "Enable PROXY protocol support.",
+		},
+		&cli.BoolFlag{
+			Name:  "allow-self-connections",
+			Usage: "Allow connections to local interface addresses on all ports, subject to normal IP and ACL checks (default: false).",
+		},
+		&cli.BoolFlag{
+			Name:  "most-specific-ip-rules",
+			Usage: "Resolve overlapping IP rules by longest prefix, then port specificity; deny wins ties (default: false).",
+		},
+		&cli.StringSliceFlag{
+			Name:  "deny-range",
+			Usage: "Add `RANGE`(in CIDR notation) to list of blocked IP ranges.  Repeatable.",
+		},
+		&cli.StringSliceFlag{
+			Name:  "unsafe-ip-filter-bypassed-domain",
+			Usage: "Bypass IP filters for destination hostname or *.domain glob; ACL and self-connection checks still apply. Trust this domain's DNS. Repeatable.",
+		},
+		&cli.StringSliceFlag{
+			Name:  "allow-range",
+			Usage: "Add `RANGE` (in CIDR notation) to list of allowed IP ranges.  Repeatable.",
+		},
+		&cli.StringSliceFlag{
+			Name:  "deny-address",
+			Usage: "Add IP[:PORT] to list of blocked IPs.  Repeatable.",
+		},
+		&cli.StringSliceFlag{
+			Name:  "allow-address",
+			Usage: "Add IP[:PORT] to list of allowed IPs.  Repeatable.",
+		},
+		&cli.StringFlag{
+			Name:  "egress-acl-file",
+			Usage: "Validate egress traffic against `FILE`",
+		},
+		&cli.BoolFlag{
+			Name:  "expose-prometheus-metrics",
+			Usage: "Expose metrics via prometheus.",
+		},
+		&cli.StringFlag{
+			Name:  "prometheus-metrics-format",
+			Value: "legacy",
+			Usage: "Prometheus metrics format: legacy, dual, or v2. Requires --expose-prometheus-metrics.",
+		},
+		&cli.StringFlag{
+			Name:  "prometheus-endpoint",
+			Value: smokescreen.DefaultPrometheusEndpoint,
+			Usage: "Expose prometheus metrics on `ENDPOINT`. Requires --expose-prometheus-metrics to be set.",
+		},
+		&cli.StringFlag{
+			Name:  "prometheus-listen-ip",
+			Value: smokescreen.DefaultPrometheusListenIP,
+			Usage: "Listen for prometheus metrics on interface with address IP. Requires --expose-prometheus-metrics to be set.",
+		},
+		&cli.StringFlag{
+			Name:  "prometheus-port",
+			Value: smokescreen.DefaultPrometheusPort,
+			Usage: "Expose prometheus metrics on `PORT`. Requires --expose-prometheus-metrics to be set.",
+		},
+		&cli.StringSliceFlag{
+			Name:  "resolver-address",
+			Usage: "Make DNS requests to `ADDRESS` (IP:port). Repeatable. Each DNS exchange picks an address at random.",
+		},
+		&cli.StringFlag{
+			Name:  "statsd-address",
+			Value: smokescreen.DefaultStatsdAddress,
+			Usage: "Send metrics to statsd at `ADDRESS` (IP:port).",
+		},
+		&cli.GenericFlag{
+			Name:  "metric-tag",
+			Value: metricTagValues,
+			Usage: "Add default metric tag `KEY=VALUE` to every metric. Repeatable; replaces metrics_tags from --config-file.",
+		},
+		&cli.StringFlag{
+			Name:  "tls-server-bundle-file",
+			Usage: "Authenticate to clients using key and certs from `FILE`",
+		},
+		&cli.StringSliceFlag{
+			Name:  "tls-client-ca-file",
+			Usage: "Validate client certificates using Certificate Authority from `FILE`",
+		},
+		&cli.StringSliceFlag{
+			Name:  "tls-crl-file",
+			Usage: "Verify validity of client certificates against Certificate Revocation List from `FILE`",
+		},
+		&cli.StringFlag{
+			Name:  "additional-error-message-on-deny",
+			Usage: "Display `MESSAGE` in the HTTP response if proxying request is denied",
+		},
+		&cli.StringSliceFlag{
+			Name:  "disable-acl-policy-action",
+			Usage: "Disable usage of a `POLICY ACTION` such as \"open\" in the egress ACL",
+		},
+		&cli.BoolFlag{
+			Name:  "acl-compat",
+			Usage: "Load an egress ACL whose service allow entries overlap the global deny list without override_global_policy,\n\t\tletting those entries win as they did in v1 and logging a warning for each. Use acl_compat in the config file\n\t\twhen the config file sets acl_file.",
+		},
+		&cli.BoolFlag{
+			Name:  "acl-allow-unknown-fields",
+			Usage: "Ignore ACL keys that the v2 format does not define, as v1 did, so that the file can carry keys for other tools.\n\t\tBy default an unknown key is an error, which also catches typos. Use acl_allow_unknown_fields in the config file\n\t\twhen the config file sets acl_file.",
+		},
+		&cli.StringFlag{
+			Name:  "stats-socket-dir",
+			Usage: "Enable connection tracking. Will expose one UDS in `DIR` going by the name of \"track-{pid}.sock\".\n\t\tThis should be an absolute path with all symlinks, if any, resolved.",
+		},
+		&cli.StringFlag{
+			Name:  "stats-socket-file-mode",
+			Value: "700",
+			Usage: "Set the filemode to `FILE_MODE` on the statistics socket",
+		},
+		&cli.BoolFlag{
+			Name:  "unsafe-allow-private-ranges",
+			Usage: "Allow private ip ranges by default",
+		},
+		&cli.StringFlag{
+			Name:  "upstream-http-proxy-addr",
+			Value: "",
+			Usage: "Set Smokescreen's upstream HTTP proxy address",
+		},
+		&cli.StringFlag{
+			Name:  "upstream-https-proxy-addr",
+			Value: "",
+			Usage: "Set Smokescreen's upstream HTTPS proxy address",
+		},
+		&cli.IntFlag{
+			Name:  "max-concurrent-requests",
+			Value: smokescreen.DefaultMaxConcurrentRequests,
+			Usage: "Maximum number of requests that can be processed simultaneously.\n\t\t0 = unlimited (default).",
+		},
+		&cli.Float64Flag{
+			Name:  "max-request-rate",
+			Value: smokescreen.DefaultMaxRequestRate,
+			Usage: "Maximum number of requests per second.\n\t\t0 = unlimited (default).",
+		},
+		&cli.IntFlag{
+			Name:  "max-request-burst",
+			Value: smokescreen.DefaultMaxRequestBurst,
+			Usage: "Maximum burst capacity for rate limiting.\n\t\tMust be greater than max-request-rate when specified.\n\t\tOmit to use default (2x max-request-rate).",
+		},
+		&cli.IntFlag{
+			Name:  "max-concurrent-connect-tunnels",
+			Value: smokescreen.DefaultMaxConcurrentConnectTunnels,
+			Usage: "Maximum number of concurrent CONNECT tunnels.\n\t\tUnlike max-concurrent-requests, this limits actual long-lived connections.\n\t\t0 = unlimited (default).",
+		},
+		&cli.DurationFlag{
+			Name:  "dns-timeout",
+			Value: smokescreen.DefaultDNSTimeout,
+			Usage: "Maximum time to wait for DNS resolution.",
+		},
+	}
+
+	app.Action = func(_ context.Context, c *cli.Command) error {
+		if c.Args().Len() > 0 {
+			return errors.New("received unexpected non-option argument(s)")
+		}
+
+		var conf *smokescreen.Config
+		if file := c.String("config-file"); file != "" {
+			var err error
+			conf, err = smokescreen.LoadConfigWithLogger(file, logger)
+			if err != nil {
+				return fmt.Errorf("couldn't load file \"%s\" specified by --config-file: %v", file, err)
+			}
+		} else {
+			conf = smokescreen.NewConfig()
+		}
+
+		if logger != nil {
+			conf.Log = logger
+		}
+
+		if c.IsSet("metric-tag") {
+			tags := make(map[string]string)
+			values, ok := c.Value("metric-tag").([]string)
+			if !ok {
+				return errors.New("could not parse --metric-tag values")
+			}
+			for _, tag := range values {
+				key, value, found := strings.Cut(tag, "=")
+				if !found || key == "" {
+					return fmt.Errorf("invalid --metric-tag %q: expected KEY=VALUE", tag)
+				}
+				tags[key] = value
+			}
+			if err := conf.SetGlobalMetricTags(tags); err != nil {
+				return fmt.Errorf("invalid global metric tags: %w", err)
+			}
+		}
+
+		if c.IsSet("listen-ip") {
+			conf.Ip = c.String("listen-ip")
+		}
+
+		if c.IsSet("listen-port") {
+			port := c.Uint("listen-port")
+			if port > math.MaxUint16 {
+				return fmt.Errorf("invalid listen-port: %d", port)
+			}
+			conf.Port = uint16(port)
+		}
+
+		if c.IsSet("timeout") {
+			conf.ConnectTimeout = c.Duration("timeout")
+		}
+
+		if c.IsSet("proxy-protocol") {
+			conf.SupportProxyProtocol = c.Bool("proxy-protocol")
+		}
+
+		if c.IsSet("allow-self-connections") {
+			conf.AllowSelfConnections = c.Bool("allow-self-connections")
+		}
+
+		if c.IsSet("additional-error-message-on-deny") {
+			conf.AdditionalErrorMessageOnDeny = c.String("additional-error-message-on-deny")
+		}
+
+		if c.IsSet("disable-acl-policy-action") {
+			conf.DisabledAclPolicyActions = c.StringSlice("disable-acl-policy-action")
+		}
+
+		if c.IsSet("acl-compat") {
+			conf.AclCompat = c.Bool("acl-compat")
+		}
+
+		if c.IsSet("acl-allow-unknown-fields") {
+			conf.AclAllowUnknownFields = c.Bool("acl-allow-unknown-fields")
+		}
+
+		if c.IsSet("stats-socket-dir") {
+			conf.StatsSocketDir = c.String("stats-socket-dir")
+		}
+
+		if c.IsSet("stats-socket-file-mode") {
+			filemode, err := strconv.ParseInt(c.String("stats-socket-file-mode"), 8, 9)
+			if err != nil {
+				return err
+			}
+			conf.StatsSocketFileMode = os.FileMode(filemode)
+		}
+
+		if c.IsSet("most-specific-ip-rules") {
+			conf.MostSpecificIPRules = c.Bool("most-specific-ip-rules")
+		}
+
+		if c.IsSet("deny-range") {
+			if err := conf.SetDenyRanges(c.StringSlice("deny-range")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("unsafe-ip-filter-bypassed-domain") {
+			if err := conf.SetIPFilterBypassedDomains(c.StringSlice("unsafe-ip-filter-bypassed-domain")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("allow-range") {
+			if err := conf.SetAllowRanges(c.StringSlice("allow-range")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("deny-address") {
+			if err := conf.SetDenyAddresses(c.StringSlice("deny-address")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("resolver-address") {
+			if err := conf.SetResolverAddresses(c.StringSlice("resolver-address")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("allow-address") {
+			if err := conf.SetAllowAddresses(c.StringSlice("allow-address")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("statsd-address") {
+			if err := conf.SetupStatsd(c.String("statsd-address")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("expose-prometheus-metrics") {
+			if err := conf.SetupPrometheus(c.String("prometheus-endpoint"), c.String("prometheus-port"), c.String("prometheus-listen-ip"), c.String("prometheus-metrics-format")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("egress-acl-file") {
+			if err := conf.SetupEgressAcl(c.String("egress-acl-file")); err != nil {
+				return err
+			}
+		} else if c.IsSet("disable-acl-policy-action") || c.IsSet("acl-compat") || c.IsSet("acl-allow-unknown-fields") {
+			// Revalidate a YAML-loaded ACL now that disabled actions and the
+			// compat and unknown-field settings are known.
+			if err := conf.ReloadEgressAcl(); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("unsafe-allow-private-ranges") {
+			conf.UnsafeAllowPrivateRanges = c.Bool("unsafe-allow-private-ranges")
+		}
+
+		// FIXME: mixing and matching parts of TLS config between cli and file
+		// hasn't been thought through and likely won't work
+
+		if c.IsSet("tls-server-bundle-file") {
+			// Originally, we assumed a single file with both cert and key
+			// concatenated.  That setup will continue to work, but SetupTLS now
+			// takes separate args for cert and key, so we pass the filename twice
+			// here.
+			bundleFile := c.String("tls-server-bundle-file")
+			if err := conf.SetupTls(
+				bundleFile,
+				bundleFile,
+				c.StringSlice("tls-client-ca-file")); err != nil {
+				return err
+			}
+		}
+
+		// SetupCrls must be called after SetupTls because it needs the CA map
+		// populated by SetupTls to verify CRL signatures.
+		if c.IsSet("tls-crl-file") {
+			if err := conf.SetupCrls(c.StringSlice("tls-crl-file")); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("upstream-http-proxy-addr") {
+			conf.UpstreamHttpProxyAddr = c.String("upstream-http-proxy-addr")
+		}
+
+		if c.IsSet("upstream-https-proxy-addr") {
+			conf.UpstreamHttpsProxyAddr = c.String("upstream-https-proxy-addr")
+		}
+
+		if c.IsSet("max-concurrent-requests") || c.IsSet("max-request-rate") {
+			maxConcurrent := c.Int("max-concurrent-requests")
+			maxRate := c.Float64("max-request-rate")
+			maxBurst := c.Int("max-request-burst")
+			if err := conf.SetRateLimits(maxConcurrent, maxRate, maxBurst); err != nil {
+				return err
+			}
+		}
+
+		if c.IsSet("max-concurrent-connect-tunnels") {
+			maxTunnels := c.Int("max-concurrent-connect-tunnels")
+			conf.MaxConcurrentConnectTunnels = maxTunnels
+		}
+
+		if c.IsSet("dns-timeout") {
+			conf.DNSTimeout = c.Duration("dns-timeout")
+		}
+
+		// Setup the connection tracker if there is not yet one in the config
+		if conf.ConnTracker == nil {
+			conf.ConnTracker = conntrack.NewTracker(conf.IdleTimeout, conf.MetricsClient, conf.ShuttingDown, nil)
+		}
+		configToReturn = conf
+		return nil
+	}
+
+	err := app.Run(context.Background(), args)
+
+	return configToReturn, err
+}
+
+type stringSliceValue struct {
+	values []string
+}
+
+func (v *stringSliceValue) Set(value string) error {
+	v.values = append(v.values, value)
+	return nil
+}
+
+func (v *stringSliceValue) String() string {
+	return strings.Join(v.values, ",")
+}
+
+func (v *stringSliceValue) Get() any {
+	return append([]string(nil), v.values...)
+}

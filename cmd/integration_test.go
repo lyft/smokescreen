@@ -1,0 +1,867 @@
+//go:build integration
+// +build integration
+
+package cmd
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+
+	proxyproto "github.com/pires/go-proxyproto"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stripe/smokescreen/v2/internal/testlog"
+	"github.com/stripe/smokescreen/v2/pkg/smokescreen"
+	acl "github.com/stripe/smokescreen/v2/pkg/smokescreen/acl/v2"
+	"github.com/stripe/smokescreen/v2/pkg/smokescreen/conntrack"
+	"github.com/stripe/smokescreen/v2/pkg/smokescreen/metrics"
+)
+
+var ProxyTargetHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(50 * time.Millisecond)
+	io.WriteString(w, "okok")
+})
+
+// loopbackResolver keeps integration tests self-contained while allowing them
+// to use hostnames that exercise ACL policy decisions.
+type loopbackResolver struct{}
+
+func (loopbackResolver) LookupPort(_ context.Context, _ string, service string) (int, error) {
+	return strconv.Atoi(service)
+}
+
+func (loopbackResolver) LookupIP(_ context.Context, _ string, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}, nil
+	}
+	return []net.IP{net.ParseIP("127.0.0.1")}, nil
+}
+
+func targetURLForHost(t *testing.T, targetURL, host string) string {
+	t.Helper()
+
+	u, err := url.Parse(targetURL)
+	require.NoError(t, err)
+	u.Host = net.JoinHostPort(host, u.Port())
+	return u.String()
+}
+
+// RoleFromRequest implementations
+func testRFRHeader(req *http.Request) (string, error) {
+	idHeader := req.Header["X-Smokescreen-Role"]
+	if len(idHeader) != 1 {
+		return "", smokescreen.MissingRoleError(fmt.Sprintf("Expected 1 header, got %d", len(idHeader)))
+	}
+	return idHeader[0], nil
+}
+func testRFRCert(req *http.Request) (string, error) {
+	if len(req.TLS.PeerCertificates) == 0 {
+		return "", smokescreen.MissingRoleError("client did not provide certificate")
+	}
+	return req.TLS.PeerCertificates[0].Subject.CommonName, nil
+}
+
+type TestCase struct {
+	ExpectAllow   bool
+	Action        acl.Mode
+	ExpectStatus  int
+	OverTLS       bool
+	OverConnect   bool
+	ProxyURL      string
+	RandomTrace   int
+	TargetURL     string
+	RoleName      string
+	UpstreamProxy string
+}
+
+// validateProxyResponse validates tests cases and expected responses from TestSmokescreenIntegration
+func validateProxyResponse(t *testing.T, test *TestCase, resp *http.Response, err error, logs []*testlog.Entry) {
+	t.Logf("HTTP Response: %#v", resp)
+
+	a := assert.New(t)
+	if test.ExpectAllow {
+		// In some cases we expect the proxy to allow the request but the upstream to return an error
+		if test.ExpectStatus != 0 {
+			if resp == nil {
+				t.Fatal(err)
+			}
+			a.Equal(test.ExpectStatus, resp.StatusCode, "Expected HTTP response code did not match")
+			return
+		}
+		// CONNECT requests which return a non-200 return an error and a nil response
+		if resp == nil {
+			a.Error(err)
+			return
+		}
+		a.Equal(test.ExpectStatus, resp.StatusCode, "HTTP Response code should indicate success.")
+	} else {
+		// CONNECT requests which return a non-200 return an error and a nil response
+		if resp == nil {
+			a.Error(err)
+			return
+		}
+		// If there is a response returned, it should contain smokescreen's error message
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		a.Contains(string(body), "denied")
+		a.Contains(string(body), "additional_error_message_validation_key")
+		a.Equal(test.ExpectStatus, resp.StatusCode, "Expected status did not match actual response code")
+	}
+
+	var entries []*testlog.Entry
+	entries = append(entries, logs...)
+
+	if len(entries) > 0 {
+		entry := findLogEntry(entries, smokescreen.CanonicalProxyDecision)
+		a.NotNil(entry)
+		a.Equal(entry.Message, smokescreen.CanonicalProxyDecision)
+
+		a.Contains(entry.Data, "allow")
+		a.Equal(test.ExpectAllow, entry.Data["allow"])
+
+		a.Contains(entry.Data, "proxy_type")
+		if test.OverConnect {
+			a.Equal("connect", entry.Data["proxy_type"])
+		} else {
+			a.Equal("http", entry.Data["proxy_type"])
+		}
+
+		a.Contains(entry.Data, "requested_host")
+		u, _ := url.Parse(test.TargetURL)
+		a.Equal(fmt.Sprintf("%s:%s", u.Hostname(), u.Port()), entry.Data["requested_host"])
+	}
+}
+
+func generateRoleForPolicy(action acl.Mode) string {
+	switch action {
+	case acl.ModeOpen:
+		return "open"
+	case acl.ModeReport:
+		return "report"
+	case acl.ModeEnforce:
+		return "enforce"
+	}
+	panic("unknown-mode")
+}
+
+func generateClientForTest(t *testing.T, test *TestCase) *http.Client {
+	a := assert.New(t)
+
+	var client *http.Client
+	proxyURL, err := url.Parse(test.ProxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if test.OverConnect {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.DisableKeepAlives = true
+		transport.MaxIdleConnsPerHost = -1
+		client = &http.Client{Transport: transport}
+		client.Transport.(*http.Transport).DialContext =
+			func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var conn net.Conn
+
+				connectProxyReq, err := http.NewRequest(
+					"CONNECT",
+					test.TargetURL,
+					nil)
+				if err != nil {
+					return nil, err
+				}
+
+				if test.OverTLS {
+					var certs []tls.Certificate
+
+					// Load client cert for role
+					if test.RoleName != "" {
+						certPath := fmt.Sprintf("testdata/pki/%s-client.pem", test.RoleName)
+						keyPath := fmt.Sprintf("testdata/pki/%s-client-key.pem", test.RoleName)
+						cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+						if err != nil {
+							return nil, err
+						}
+						certs = append(certs, cert)
+					}
+
+					caBytes, err := os.ReadFile("testdata/pki/ca.pem")
+					if err != nil {
+						return nil, err
+					}
+					caPool := x509.NewCertPool()
+					a.True(caPool.AppendCertsFromPEM(caBytes))
+
+					proxyTLSClientConfig := tls.Config{
+						Certificates: certs,
+						RootCAs:      caPool,
+					}
+					connRaw, err := tls.Dial("tcp", proxyURL.Host, &proxyTLSClientConfig)
+					if err != nil {
+						return nil, err
+					}
+					conn = connRaw
+				} else {
+					connRaw, err := net.Dial(network, proxyURL.Host)
+					if err != nil {
+						return nil, err
+					}
+					conn = connRaw
+
+					// If we're not talking to the proxy over TLS, let's use headers as identifiers
+					connectProxyReq.Header.Add("X-Smokescreen-Role", "egressneedingservice-"+test.RoleName)
+					connectProxyReq.Header.Add("X-Smokescreen-Trace-ID", fmt.Sprintf("%d", test.RandomTrace))
+				}
+
+				t.Logf("connect request: %#v", connectProxyReq)
+				connectProxyReq.Write(conn)
+
+				// Read the response from the connect request and return an error for any non-200
+				// from smokescreen
+				br := bufio.NewReader(conn)
+				resp, err := http.ReadResponse(br, connectProxyReq)
+				if err != nil {
+					conn.Close()
+					return nil, err
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					resp, err := io.ReadAll(resp.Body)
+					if err != nil {
+						return nil, err
+					}
+					conn.Close()
+					return nil, errors.New(string(resp))
+				}
+				return conn, nil
+			}
+	} else {
+		client = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+			},
+		}
+	}
+
+	client.Transport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+	return client
+}
+
+func generateRequestForTest(t *testing.T, test *TestCase) *http.Request {
+	a := assert.New(t)
+
+	req, err := http.NewRequest("GET", test.TargetURL, nil)
+	a.NoError(err)
+
+	if !test.OverTLS && !test.OverConnect {
+		// If we're not talking to the proxy over TLS, let's use headers as identifiers
+		req.Header.Add("X-Smokescreen-Role", "egressneedingservice-"+test.RoleName)
+		req.Header.Add("X-Smokescreen-Trace-ID", fmt.Sprintf("%d", test.RandomTrace))
+	}
+
+	t.Logf("HTTP Request: %#v", req)
+	return req
+}
+
+func executeRequestForTest(t *testing.T, test *TestCase, logHook *testlog.Handler) (*http.Response, error) {
+	t.Logf("Executing Request for test case %#v", test)
+
+	logHook.Reset()
+
+	client := generateClientForTest(t, test)
+	req := generateRequestForTest(t, test)
+
+	return client.Do(req)
+}
+
+func TestSmokescreenIntegration(t *testing.T) {
+	var logHook testlog.Handler
+
+	// Holds TLS and non-TLS enabled local HTTP servers
+	httpServers := map[bool]*httptest.Server{}
+
+	// Holds TLS and non-TLS enabled Smokescreen instances
+	proxyServers := map[bool]*httptest.Server{}
+
+	// Contains local http and https URLs with hostnames that are not allowed by
+	// the enforce ACL policy. loopbackResolver maps them to the local targets.
+	disallowedHosts := make(map[bool]string)
+
+	for _, useTLS := range []bool{true, false} {
+		// Smokescreen instances
+		_, proxyServer, err := startSmokescreen(t, useTLS, &logHook, "")
+		require.NoError(t, err)
+		defer proxyServer.Close()
+		proxyServers[useTLS] = proxyServer
+
+		if useTLS {
+			httpServer := httptest.NewTLSServer(ProxyTargetHandler)
+			defer httpServer.Close()
+			httpServers[useTLS] = httpServer
+			disallowedHosts[useTLS] = targetURLForHost(t, httpServer.URL, "disallowed.test")
+		} else {
+			httpServer := httptest.NewServer(ProxyTargetHandler)
+			defer httpServer.Close()
+			httpServers[useTLS] = httpServer
+			disallowedHosts[useTLS] = targetURLForHost(t, httpServer.URL, "disallowed.test")
+		}
+	}
+
+	// Send the proxy request via TLS
+	overTLSOptions := []bool{true, false}
+
+	// Send the proxy request using CONNECT
+	overConnectOptions := []bool{true, false}
+
+	// If the proxy target should be sent to an authorized host
+	authorizedHosts := []bool{true, false}
+
+	enforcementPolicies := []acl.Mode{
+		acl.ModeEnforce,
+		acl.ModeReport,
+		acl.ModeOpen,
+	}
+
+	var testCases []*TestCase
+
+	// This generates all the permutations for the common test cases
+	// * proxy requests using CONNECT and regular HTTP proxy
+	// * TLS and non-TLS proxy targets
+	// * hosts authorized and not authorized by the config in testdata/acl_sample_config.yaml
+	// * enforce, report, and open enforcement policies
+	for _, overConnect := range overConnectOptions {
+		for _, overTLS := range overTLSOptions {
+			// Explicitly do not support these test cases
+			// 1) You cannot tunnel TLS using a traditional HTTP proxy request
+			// 2) If you attempt to tunnel a non-TLS HTTP request using CONNECT,
+			//    Go's HTTP machinery rewrites the scheme as HTTPS.
+			if (overTLS && !overConnect) || (!overTLS && overConnect) {
+				continue
+			}
+
+			// An authorizedHost indicates the request should be sent to our
+			// local HTTP server. If authorizedHost is false, the request
+			// will use a locally resolved hostname that may or may not be allowed
+			// depending on the acl.Mode.
+			for _, authorizedHost := range authorizedHosts {
+				var proxyTarget string
+				if authorizedHost {
+					proxyTarget = httpServers[overTLS].URL
+				} else {
+					proxyTarget = disallowedHosts[overTLS]
+				}
+
+				for _, policy := range enforcementPolicies {
+					var expectAllow bool
+					// If a host is authorized, it is allowed by the config
+					// and will always be allowed.
+					if authorizedHost {
+						expectAllow = true
+					}
+
+					// Report and open modes should always allow requests.
+					if policy != acl.ModeEnforce {
+						expectAllow = true
+					}
+
+					testCase := &TestCase{
+						ExpectAllow: expectAllow,
+						Action:      policy,
+						OverTLS:     overTLS,
+						OverConnect: overConnect,
+						ProxyURL:    proxyServers[overTLS].URL,
+						TargetURL:   proxyTarget,
+						RoleName:    generateRoleForPolicy(policy),
+					}
+
+					if expectAllow {
+						testCase.ExpectStatus = http.StatusOK
+					} else {
+						testCase.ExpectStatus = http.StatusProxyAuthRequired
+					}
+					testCases = append(testCases, testCase)
+				}
+			}
+		}
+
+		baseCase := TestCase{
+			OverTLS:     false,
+			OverConnect: overConnect,
+			ProxyURL:    proxyServers[false].URL,
+		}
+
+		// Empty roles should default deny per the test config
+		noRoleDenyCase := baseCase
+		noRoleDenyCase.TargetURL = httpServers[baseCase.OverTLS].URL
+		noRoleDenyCase.ExpectAllow = false
+		noRoleDenyCase.ExpectStatus = http.StatusProxyAuthRequired
+
+		// Unknown roles should default deny per the test config
+		unknownRoleDenyCase := baseCase
+		unknownRoleDenyCase.TargetURL = httpServers[baseCase.OverTLS].URL
+		unknownRoleDenyCase.RoleName = "unknown"
+		unknownRoleDenyCase.ExpectAllow = false
+		unknownRoleDenyCase.ExpectStatus = http.StatusProxyAuthRequired
+
+		// This must be a global unicast, non-loopback address or other IP rules will
+		// block it regardless of the specific configuration we're trying to test.
+		badIPRangeCase := baseCase
+		badIPRangeCase.TargetURL = "http://1.1.1.1:80"
+		badIPRangeCase.ExpectAllow = false
+		badIPRangeCase.ExpectStatus = http.StatusProxyAuthRequired
+		badIPRangeCase.RoleName = generateRoleForPolicy(acl.ModeOpen)
+
+		// This must be a global unicast, non-loopback address or other IP rules will
+		// block it regardless of the specific configuration we're trying to test.
+		badIPAddressCase := baseCase
+		badIPAddressCase.TargetURL = "http://1.0.0.1:123"
+		badIPAddressCase.ExpectAllow = false
+		badIPAddressCase.ExpectStatus = http.StatusProxyAuthRequired
+		badIPAddressCase.RoleName = generateRoleForPolicy(acl.ModeOpen)
+
+		testCases = append(testCases,
+			&unknownRoleDenyCase, &noRoleDenyCase,
+			&badIPRangeCase, &badIPAddressCase,
+		)
+	}
+
+	for _, testCase := range testCases {
+		t.Run("", func(t *testing.T) {
+			testCase.RandomTrace = rand.Int()
+			resp, err := executeRequestForTest(t, testCase, &logHook)
+			validateProxyResponse(t, testCase, resp, err, logHook.AllEntries())
+		})
+	}
+}
+
+// validateProxyResponseWithUpstream validates tests cases and expected responses
+// from TestUpstreamProxySmokescreenIntegration. This validates that requests
+// sent to a smokescreen instance with an additional upstream proxy set
+// (proxy chaining) forwards the request to the next proxy hop instead of directly
+// to the proxy target.
+func validateProxyResponseWithUpstream(t *testing.T, test *TestCase, resp *http.Response, err error, logs []*testlog.Entry) {
+	a := assert.New(t)
+	t.Logf("HTTP Response: %#v", resp)
+
+	if test.OverConnect {
+		if a.Error(err) {
+			a.Contains(err.Error(), "proxy refused connection")
+		}
+	} else {
+		a.NotNil(resp)
+		a.Equal(http.StatusBadGateway, resp.StatusCode)
+	}
+}
+
+func TestInvalidUpstreamProxyConfiguration(t *testing.T) {
+	var logHook testlog.Handler
+	servers := map[bool]*httptest.Server{}
+
+	failingUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}))
+	defer failingUpstream.Close()
+
+	httpTarget := httptest.NewServer(ProxyTargetHandler)
+	defer httpTarget.Close()
+	httpsTarget := httptest.NewTLSServer(ProxyTargetHandler)
+	defer httpsTarget.Close()
+
+	// Create TLS and non-TLS instances of Smokescreen
+	for _, useTLS := range []bool{true, false} {
+		_, server, err := startSmokescreen(t, useTLS, &logHook, failingUpstream.URL)
+		require.NoError(t, err)
+		defer server.Close()
+		servers[useTLS] = server
+	}
+
+	// The local upstream proxy rejects requests before a target connection is
+	// attempted, exercising both HTTP and CONNECT upstream-proxy failures.
+	for _, overConnect := range []bool{true, false} {
+		t.Run(fmt.Sprintf("illegal proxy with CONNECT %t", overConnect), func(t *testing.T) {
+			var proxyTarget string
+			if overConnect {
+				proxyTarget = targetURLForHost(t, httpsTarget.URL, "upstream-target.test")
+			} else {
+				proxyTarget = targetURLForHost(t, httpTarget.URL, "upstream-target.test")
+			}
+
+			testCase := &TestCase{
+				OverConnect:  overConnect,
+				OverTLS:      overConnect,
+				ProxyURL:     servers[overConnect].URL,
+				TargetURL:    proxyTarget,
+				RoleName:     generateRoleForPolicy(acl.ModeOpen),
+				ExpectStatus: http.StatusBadGateway,
+			}
+			resp, err := executeRequestForTest(t, testCase, &logHook)
+			validateProxyResponseWithUpstream(t, testCase, resp, err, logHook.AllEntries())
+
+		})
+	}
+}
+
+func TestClientHalfCloseConnection(t *testing.T) {
+	a := assert.New(t)
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "TCP is great!")
+	})
+	remote := httptest.NewServer(h)
+
+	var logHook testlog.Handler
+
+	conf, server, err := startSmokescreen(t, false, &logHook, "")
+	require.NoError(t, err)
+	defer server.Close()
+
+	proxyCon, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Error(err)
+	}
+
+	// Send the CONNECT request to Smokescreen
+	conReq, err := http.NewRequest("CONNECT", remote.URL, nil)
+	if err != nil {
+		t.Error(err)
+	}
+	conReq.Header.Add("X-Smokescreen-Role", "egressneedingservice-open")
+	if err := conReq.Write(proxyCon); err != nil {
+		t.Error(err)
+	}
+
+	buf := bufio.NewReader(proxyCon)
+	resp, err := http.ReadResponse(buf, conReq)
+	if err != nil {
+		t.Error(err)
+	}
+
+	a.Equal(resp.StatusCode, http.StatusOK)
+
+	// Send the response to the "remote" server
+	req, err := http.NewRequest("GET", remote.URL, nil)
+	if err != nil {
+		t.Error(err)
+	}
+	if err := req.Write(proxyCon); err != nil {
+		t.Error(err)
+	}
+	resp, err = http.ReadResponse(buf, req)
+	if err != nil {
+		t.Error(err)
+	}
+	a.Equal(resp.StatusCode, http.StatusOK)
+
+	// Unwrap the underlying net.TCPConn
+	tcpConn, ok := proxyCon.(*net.TCPConn)
+	if !ok {
+		t.Error("conn did not unwrap to net.TCPConn")
+	}
+
+	// Now half close the connection and check that Smokescreen
+	// logged a connection close event
+	tcpConn.CloseWrite()
+
+	conf.ConnTracker.Wg().Wait()
+
+	entries := logHook.AllEntries()
+	entry := findLogEntry(entries, "CANONICAL-PROXY-CN-CLOSE")
+	a.NotNil(entry)
+}
+
+func TestProxyProtocolIntegration(t *testing.T) {
+	target := httptest.NewServer(ProxyTargetHandler)
+	defer target.Close()
+
+	var logHook testlog.Handler
+	proxyAddr := startSmokescreenWithProxyProtocol(t, &logHook)
+
+	v2Header, err := proxyproto.HeaderProxyFromAddrs(
+		2,
+		&net.TCPAddr{IP: net.ParseIP("192.0.2.3"), Port: 23456},
+		&net.TCPAddr{IP: net.ParseIP("192.0.2.4"), Port: 443},
+	).Format()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name           string
+		header         []byte
+		expectedRemote string
+	}{
+		{
+			name:           "PROXY v1 header",
+			header:         []byte("PROXY TCP4 192.0.2.1 192.0.2.2 12345 443\r\n"),
+			expectedRemote: "192.0.2.1:12345",
+		},
+		{
+			name:           "PROXY v2 header",
+			header:         v2Header,
+			expectedRemote: "192.0.2.3:23456",
+		},
+		{
+			name: "direct connection",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logHook.Reset()
+
+			conn, err := net.Dial("tcp", proxyAddr)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			if len(tt.header) > 0 {
+				_, err = conn.Write(tt.header)
+				require.NoError(t, err)
+			}
+
+			req, err := http.NewRequest("GET", target.URL, nil)
+			require.NoError(t, err)
+			req.Header.Set("X-Smokescreen-Role", "egressneedingservice-open")
+			require.NoError(t, req.WriteProxy(conn))
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Equalf(t, http.StatusOK, resp.StatusCode, "response body: %s", body)
+			assert.Equal(t, "okok", string(body))
+
+			if tt.expectedRemote != "" {
+				entry := findLogEntry(logHook.AllEntries(), smokescreen.CanonicalProxyDecision)
+				require.NotNil(t, entry)
+				assert.Equal(t, tt.expectedRemote, entry.Data[smokescreen.LogFieldInRemoteAddr])
+			}
+		})
+	}
+}
+
+func findLogEntry(entries []*testlog.Entry, msg string) *testlog.Entry {
+	for _, entry := range entries {
+		if entry.Message == msg {
+			return entry
+		}
+	}
+	return nil
+}
+
+func startSmokescreen(t *testing.T, useTLS bool, logHook *testlog.Handler, httpProxyAddr string) (*smokescreen.Config, *httptest.Server, error) {
+	args := []string{
+		"smokescreen",
+		"--listen-ip=127.0.0.1",
+		"--config-file=testdata/config.yaml",
+		"--additional-error-message-on-deny=additional_error_message_validation_key",
+		"--deny-range=1.1.1.1/32",
+		"--allow-range=127.0.0.1/32",
+		"--deny-address=1.0.0.1:123",
+	}
+
+	if useTLS {
+		args = append(args,
+			"--tls-server-bundle-file=testdata/pki/server-bundle.pem",
+			"--tls-client-ca-file=testdata/pki/ca.pem",
+			"--tls-crl-file=testdata/pki/crl.pem",
+		)
+	}
+
+	if httpProxyAddr != "" {
+		args = append(args, fmt.Sprintf("--upstream-http-proxy-addr=%s", httpProxyAddr))
+		args = append(args, fmt.Sprintf("--upstream-https-proxy-addr=%s", httpProxyAddr))
+	}
+
+	logger := slog.New(logHook)
+	conf, err := NewConfiguration(args, logger)
+	if err != nil {
+		t.Fatalf("Failed to create configuration: %v", err)
+	}
+	require.Same(t, logger, conf.Log)
+	require.NotNil(t, findLogEntry(logHook.AllEntries(), "Loading egress ACL from testdata/acl_sample_config.yaml"))
+
+	if useTLS {
+		conf.RoleFromRequest = testRFRCert
+	} else {
+		conf.RoleFromRequest = testRFRHeader
+	}
+
+	conf.MetricsClient = metrics.NewNoOpMetricsClient()
+	conf.Resolver = loopbackResolver{}
+
+	conf.ConnectTimeout = time.Second
+
+	handler := smokescreen.BuildProxy(conf)
+	server := httptest.NewUnstartedServer(handler)
+
+	if useTLS {
+		server.TLS = conf.TlsConfig
+		server.StartTLS()
+	} else {
+		server.Start()
+	}
+
+	return conf, server, nil
+}
+
+func startSmokescreenWithProxyProtocol(t *testing.T, logHook slog.Handler) string {
+	t.Helper()
+
+	args := []string{
+		"smokescreen",
+		"--listen-ip=127.0.0.1",
+		"--egress-acl-file=testdata/acl_sample_config.yaml",
+		"--allow-range=127.0.0.1/32",
+		"--proxy-protocol",
+	}
+	conf, err := NewConfiguration(args, nil)
+	require.NoError(t, err)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	conf.Listener = listener
+	conf.RoleFromRequest = testRFRHeader
+	conf.MetricsClient = metrics.NewNoOpMetricsClient()
+	conf.Resolver = loopbackResolver{}
+	conf.ConnectTimeout = time.Second
+	conf.Log = slog.New(logHook)
+
+	// Skip self-connection auto-detection, which would otherwise deny our
+	// own 127.0.0.1 test target as a self-connection.
+	conf.LocalIPs = []net.IP{}
+
+	quit := make(chan interface{}, 1)
+	done := make(chan struct{})
+	go func() {
+		smokescreen.StartWithConfig(conf, quit)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		quit <- true
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out stopping proxy-protocol server")
+		}
+	})
+
+	return listener.Addr().String()
+}
+
+func TestCRLEnforcement(t *testing.T) {
+	var logHook testlog.Handler
+
+	_, proxyServer, err := startSmokescreen(t, true, &logHook, "")
+	require.NoError(t, err)
+	defer proxyServer.Close()
+
+	targetServer := httptest.NewServer(ProxyTargetHandler)
+	defer targetServer.Close()
+
+	proxyURL, err := url.Parse(proxyServer.URL)
+	require.NoError(t, err)
+
+	connectWithCert := func(certFile, keyFile string) error {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return err
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: true,
+		}
+
+		conn, err := tls.Dial("tcp", proxyURL.Host, tlsConfig)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		req, _ := http.NewRequest("CONNECT", targetServer.URL, nil)
+		req.Write(conn)
+
+		br := bufio.NewReader(conn)
+		_, err = http.ReadResponse(br, req)
+		return err
+	}
+
+	t.Run("valid certificate is accepted", func(t *testing.T) {
+		err := connectWithCert("testdata/pki/enforce-client.pem", "testdata/pki/enforce-client-key.pem")
+		assert.NoError(t, err)
+	})
+
+	t.Run("revoked certificate is rejected", func(t *testing.T) {
+		err := connectWithCert("testdata/pki/revoked-client.pem", "testdata/pki/revoked-client-key.pem")
+		assert.Error(t, err)
+	})
+}
+
+// TestIPRulePrecedenceIntegration exercises CLI configuration through HTTP
+// forwarding and CONNECT tunnels using only local destinations.
+func TestIPRulePrecedenceIntegration(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		target := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+		if useTLS {
+			target.StartTLS()
+		} else {
+			target.Start()
+		}
+		defer target.Close()
+		for _, tt := range []struct {
+			name, allow, deny string
+			mostSpecific      bool
+			want              int
+		}{
+			{"default allows overlap", "--allow-range=127.0.0.0/8", "--deny-address=127.0.0.1", false, http.StatusNoContent},
+			{"specific deny", "--allow-range=127.0.0.0/8", "--deny-address=127.0.0.1", true, http.StatusProxyAuthRequired},
+			{"specific allow", "--allow-address=127.0.0.1", "--deny-range=127.0.0.0/8", true, http.StatusNoContent},
+			{"deny wins tie", "--allow-address=127.0.0.1", "--deny-address=127.0.0.1", true, http.StatusProxyAuthRequired},
+		} {
+			t.Run(fmt.Sprintf("%s/TLS=%t", tt.name, useTLS), func(t *testing.T) {
+				config, err := NewConfiguration([]string{"smokescreen", fmt.Sprintf("--most-specific-ip-rules=%t", tt.mostSpecific), tt.allow, tt.deny}, nil)
+				require.NoError(t, err)
+				config.MetricsClient = metrics.NewNoOpMetricsClient()
+				config.ConnTracker = conntrack.NewTracker(config.IdleTimeout, config.MetricsClient, config.ShuttingDown, nil)
+				proxy := httptest.NewServer(smokescreen.BuildProxy(config))
+				defer proxy.Close()
+				proxyURL, err := url.Parse(proxy.URL)
+				require.NoError(t, err)
+				transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+				if useTLS {
+					roots := x509.NewCertPool()
+					roots.AddCert(target.Certificate())
+					transport.TLSClientConfig = &tls.Config{RootCAs: roots}
+				}
+				defer transport.CloseIdleConnections()
+				client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+				response, err := client.Get(target.URL)
+				if useTLS && tt.want == http.StatusProxyAuthRequired {
+					require.Error(t, err)
+					require.Contains(t, err.Error(), "Request rejected by proxy")
+					return
+				}
+				require.NoError(t, err)
+				defer response.Body.Close()
+				require.Equal(t, tt.want, response.StatusCode)
+			})
+		}
+	}
+}

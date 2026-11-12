@@ -1,0 +1,20 @@
+---
+version: v2
+services:
+  - name: egressneedingservice-enforce
+    project: test
+    action: enforce
+    allow:
+      - domains: [127.0.0.1]
+
+  - name: egressneedingservice-report
+    project: test
+    action: report
+
+  - name: egressneedingservice-open
+    project: test
+    action: open
+
+default:
+  project: security
+  action: enforce

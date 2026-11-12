@@ -1,0 +1,220 @@
+package metrics
+
+import (
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/DataDog/datadog-go/v5/statsd"
+)
+
+// StatsdMetricsClient is a thin wrapper around statsd.ClientInterface. It is used to allow
+// adding arbitrary tags to Smokescreen metrics.
+//
+// StatsdMetricsClient is not thread safe and should not be used concurrently.
+type StatsdMetricsClient struct {
+	metricsTags  map[string][]string
+	namespace    string
+	statsdClient statsd.ClientInterface
+	started      atomic.Value
+	globalTags   atomic.Value
+}
+
+// NewMetricsClient creates a new StatsdMetricsClient with the provided statsd address and
+// namespace.
+func NewStatsdMetricsClient(addr, namespace string) (*StatsdMetricsClient, error) {
+	c, err := statsd.New(
+		addr,
+		statsd.WithClientSideAggregation(),
+		statsd.WithAggregationInterval(2*time.Second),
+		statsd.WithoutOriginDetection(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Populate the client's map to hold metric tags
+	metricsTags := make(map[string][]string)
+	for _, m := range metrics {
+		metricsTags[m] = []string{}
+	}
+
+	return &StatsdMetricsClient{
+		metricsTags:  metricsTags,
+		namespace:    namespace,
+		statsdClient: c,
+	}, nil
+}
+
+// NewNoOpMetricsClient returns a StatsdMetricsClient with a no-op statsd client. This can
+// be used when there's no statsd service available to smokescreen.
+func NewNoOpMetricsClient() *StatsdMetricsClient {
+	// Populate the client's map to hold metric tags
+	metricsTags := make(map[string][]string)
+	for _, m := range metrics {
+		metricsTags[m] = []string{}
+	}
+
+	return &StatsdMetricsClient{
+		metricsTags:  metricsTags,
+		statsdClient: &statsd.NoOpClient{},
+	}
+}
+
+// AddMetricTags associates the provided tags slice with a given metric. The metric must be present
+// in the metrics slice.
+//
+// Once a metric has tags added via AddMetricTags, those tags will *always* be attached whenever
+// that metric is emitted.
+// For example, calling `AddMetricTags(foo, [bar])` will cause the `bar` tag to be added to
+// *every* metric `foo` that is emitted for the lifetime of the StatsdMetricsClient.
+//
+// This function is not thread safe, and adding persistent tags should only be done while initializing
+// the configuration and prior to running smokescreen.
+func (mc *StatsdMetricsClient) AddMetricTags(
+	metric string,
+	additionalTags map[string]string) error {
+	if mc.started.Load() != nil {
+		return fmt.Errorf("cannot add metrics baseTags after starting smokescreen")
+	}
+	if baseTags, ok := mc.metricsTags[metric]; ok {
+		mc.metricsTags[metric] = append(baseTags, constructTagArray(additionalTags)...)
+		return nil
+	}
+	return fmt.Errorf("unknown metric: %s", metric)
+}
+
+func (mc *StatsdMetricsClient) SetGlobalMetricTags(tags map[string]string) error {
+	copy, err := CopyAndValidateGlobalMetricTags(tags)
+	if err != nil {
+		return err
+	}
+	if mc.started.Load() != nil {
+		return fmt.Errorf("cannot set global metrics tags after starting smokescreen")
+	}
+	mc.globalTags.Store(copy)
+	return nil
+}
+
+func (mc *StatsdMetricsClient) globalAndSpecificTags(dynamicTags map[string]string, specific []string) []string {
+	var global []string
+	if tags := mc.globalTags.Load(); tags != nil {
+		global = constructTagArray(tags.(map[string]string))
+	}
+	if len(global) == 0 {
+		if len(dynamicTags) == 0 {
+			return specific
+		}
+		combined := make([]string, 0, len(dynamicTags)+len(specific))
+		for key, value := range dynamicTags {
+			combined = append(combined, key+":"+value)
+		}
+		return append(combined, specific...)
+	}
+	specificKeys := make(map[string]struct{}, len(dynamicTags)+len(specific))
+	for key := range dynamicTags {
+		key, _, _ = strings.Cut(key, ":")
+		specificKeys[key] = struct{}{}
+	}
+	for _, tag := range specific {
+		key, _, _ := strings.Cut(tag, ":")
+		specificKeys[key] = struct{}{}
+	}
+	combined := make([]string, 0, len(global)+len(dynamicTags)+len(specific))
+	for _, tag := range global {
+		key, _, _ := strings.Cut(tag, ":")
+		if _, exists := specificKeys[key]; !exists {
+			combined = append(combined, tag)
+		}
+	}
+	for key, value := range dynamicTags {
+		combined = append(combined, key+":"+value)
+	}
+	return append(combined, specific...)
+}
+
+// GetMetricTags returns the slice of metrics associated with a given metric.
+func (mc *StatsdMetricsClient) GetMetricTags(metric string) []string {
+	if tags, ok := mc.metricsTags[metric]; ok {
+		return tags
+	}
+	return nil
+}
+
+func (mc *StatsdMetricsClient) Incr(metric string, rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Incr(mc.metricName(metric), mc.globalAndSpecificTags(nil, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) IncrWithTags(
+	metric string,
+	additionalTags map[string]string,
+	rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Incr(mc.metricName(metric), mc.globalAndSpecificTags(additionalTags, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) Gauge(
+	metric string,
+	value float64, rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Gauge(mc.metricName(metric), value, mc.globalAndSpecificTags(nil, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) Histogram(
+	metric string,
+	value float64,
+	rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Histogram(mc.metricName(metric), value, mc.globalAndSpecificTags(nil, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) HistogramWithTags(
+	metric string,
+	value float64,
+	additionalTags map[string]string,
+	rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Histogram(mc.metricName(metric), value, mc.globalAndSpecificTags(additionalTags, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) Timing(metric string, d time.Duration, rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Timing(mc.metricName(metric), d, mc.globalAndSpecificTags(nil, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) TimingWithTags(
+	metric string,
+	d time.Duration,
+	additionalTags map[string]string,
+	rate float64) error {
+	baseTags := mc.GetMetricTags(metric)
+	return mc.statsdClient.Timing(mc.metricName(metric), d, mc.globalAndSpecificTags(additionalTags, baseTags), rate)
+}
+
+func (mc *StatsdMetricsClient) StatsdClient() statsd.ClientInterface {
+	return mc.statsdClient
+}
+
+func (mc *StatsdMetricsClient) SetStarted() {
+	mc.started.Store(true)
+}
+
+func (mc *StatsdMetricsClient) metricName(metric string) string {
+	return mc.namespace + metric
+}
+
+// StatsdMetricsClient implements MetricsClientInterface
+var _ MetricsClientInterface = &StatsdMetricsClient{}
+
+func constructTagArray(tags map[string]string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	tagArray := make([]string, 0, len(tags))
+	for key, value := range tags {
+		tagArray = append(tagArray, key+":"+value)
+	}
+	return tagArray
+}
